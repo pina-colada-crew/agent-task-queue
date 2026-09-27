@@ -20,7 +20,7 @@ os.environ["TASK_QUEUE_POLL_READY"] = "0.1"
 
 from datetime import datetime, timedelta
 from fastmcp import Client
-from fastmcp.client.transports import PythonStdioTransport
+from fastmcp.client.transports import PythonStdioTransport, StdioTransport
 import queue_core
 import task_queue
 from task_queue import (
@@ -813,6 +813,63 @@ async def test_command_cannot_disturb_the_stdio_transport(tmp_path):
 
     assert run_result["status"] == "success"
     assert status.structured_content["result"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_warnings_stay_off_the_stdio_transport(tmp_path):
+    """Cleanup warnings must go to stderr, because the server's stdout is the MCP stdio transport.
+
+    A running row whose parent PID is dead makes the next run_task on that queue clear a zombie
+    lock and log a warning. The server's stdout is teed to a file so the test can check that every
+    line on it is a JSON-RPC message, whether or not the client tolerates stray lines. The server
+    runs unbuffered because print() goes through sys.stdout's own buffer, which the transport
+    bypasses: buffered, a stray line would surface only at some later flush, possibly mid-message.
+    """
+    data_dir = tmp_path / "data"
+    queue_core.init_db(queue_core.QueuePaths.from_data_dir(data_dir))
+    dead_process = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_process.wait()
+    with queue_core.get_db(data_dir / "queue.db") as conn:
+        conn.execute(
+            "INSERT INTO queue (queue_name, status, pid) VALUES (?, 'running', ?)",
+            ("stdio_cleanup_test", dead_process.pid),
+        )
+        conn.commit()
+
+    server_stdout_path = tmp_path / "server_stdout.jsonl"
+    server_command = " ".join(
+        shlex.quote(part)
+        for part in [sys.executable, task_queue.__file__, f"--data-dir={data_dir}"]
+    )
+    stdio_client = Client(
+        StdioTransport(
+            command="sh",
+            args=["-c", f"{server_command} | tee {shlex.quote(str(server_stdout_path))}"],
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            keep_alive=False,
+        )
+    )
+
+    async with stdio_client:
+        run = await stdio_client.call_tool(
+            "run_task",
+            {
+                "command": "true",
+                "working_directory": "/tmp",
+                "queue_name": "stdio_cleanup_test",
+                "timeout_seconds": 5,
+            },
+        )
+
+    assert run.structured_content["result"]["status"] == "success"
+    with queue_core.get_db(data_dir / "queue.db") as conn:
+        zombie_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM queue WHERE pid = ?",
+            (dead_process.pid,),
+        ).fetchone()["c"]
+    assert zombie_count == 0
+    for line in server_stdout_path.read_text().splitlines():
+        assert json.loads(line)["jsonrpc"] == "2.0"
 
 
 @pytest.mark.asyncio
