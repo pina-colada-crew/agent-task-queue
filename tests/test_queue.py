@@ -1451,6 +1451,22 @@ def test_is_task_queue_process_accepts_installed_tq_entrypoint(monkeypatch):
     assert queue_core.is_task_queue_process(12345) is True
 
 
+def test_is_task_queue_process_sees_entrypoint_past_terminal_width(monkeypatch, tmp_path):
+    """A long interpreter path must not push the entrypoint out of ps's view."""
+    monkeypatch.setenv("COLUMNS", "80")
+    long_directory = tmp_path / ("uv-cache-" + "x" * 100)
+    long_directory.mkdir()
+    entrypoint = long_directory / "agent-task-queue"
+    entrypoint.write_text("import time\ntime.sleep(60)\n")
+
+    queue_server = subprocess.Popen([sys.executable, str(entrypoint)])
+    try:
+        assert queue_core.is_task_queue_process(queue_server.pid) is True
+    finally:
+        queue_server.kill()
+        queue_server.wait()
+
+
 def test_attempt_task_start_after_core_cleanup_commit_on_same_connection():
     """Callers can reuse the same connection after committing cleanup work."""
     dead_pid = 999999999

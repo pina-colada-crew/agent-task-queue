@@ -548,8 +548,11 @@ def is_task_queue_process(pid: int) -> bool:
     try:
         import subprocess
 
+        # -ww: ps otherwise cuts args at $COLUMNS (or 80 columns), even when
+        # stdout is not a terminal, which can hide the entrypoint behind a long
+        # interpreter path such as a uvx cache directory.
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],
             capture_output=True,
             text=True,
             timeout=5,
