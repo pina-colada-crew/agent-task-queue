@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1449,6 +1450,49 @@ def test_is_task_queue_process_accepts_installed_tq_entrypoint(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert queue_core.is_task_queue_process(12345) is True
+
+
+# MCP servers inherit COLUMNS from the agent's terminal, and plain `ps` truncates `args`
+# to it, cutting off the entrypoint of a long `uvx` command line.
+NARROW_TERMINAL_COLUMNS = "80"
+LONG_ARGV_PADDING = "x" * 150
+
+
+@contextmanager
+def spawn_process_with_argv(argv: list[str]):
+    """Run a python process that blocks on stdin, showing `argv` in `ps`.
+
+    argv[0] is a bare name rather than sys.executable, whose venv path lives under the
+    repository checkout and would itself contain `agent-task-queue`.
+    """
+    process = subprocess.Popen(
+        argv,
+        executable=sys.executable,
+        stdin=subprocess.PIPE,
+    )
+    try:
+        yield process
+    finally:
+        process.stdin.close()
+        process.wait()
+
+
+def test_is_task_queue_process_reads_full_command_line_in_narrow_terminal(monkeypatch):
+    """The entrypoint past the terminal width must still identify a live queue server."""
+    monkeypatch.setenv("COLUMNS", NARROW_TERMINAL_COLUMNS)
+    argv = ["python3", "-c", "import sys; sys.stdin.read()", LONG_ARGV_PADDING, "agent-task-queue"]
+
+    with spawn_process_with_argv(argv) as process:
+        assert queue_core.is_task_queue_process(process.pid) is True
+
+
+def test_is_task_queue_process_rejects_long_unrelated_command_line(monkeypatch):
+    """A reused PID running something else must still be rejected."""
+    monkeypatch.setenv("COLUMNS", NARROW_TERMINAL_COLUMNS)
+    argv = ["python3", "-c", "import sys; sys.stdin.read()", LONG_ARGV_PADDING, "unrelated"]
+
+    with spawn_process_with_argv(argv) as process:
+        assert queue_core.is_task_queue_process(process.pid) is False
 
 
 def test_attempt_task_start_after_core_cleanup_commit_on_same_connection():
