@@ -195,7 +195,7 @@ def cleanup_queue(conn, queue_name: str, queue_capacities: dict[str, int] | None
             target_queue,
             PATHS.metrics_path,
             MAX_LOCK_AGE_MINUTES,
-            log_fn=lambda msg: print(log_fmt(msg)),
+            log_fn=log_to_stderr,
         )
 
         my_pid = os.getpid()
@@ -209,7 +209,7 @@ def cleanup_queue(conn, queue_name: str, queue_capacities: dict[str, int] | None
 
         for task in stale_server_tasks:
             if task["child_pid"] and is_process_alive(task["child_pid"]):
-                print(log_fmt(f"WARNING: Killing orphaned subprocess {task['child_pid']} from old server"))
+                log_to_stderr(f"WARNING: Killing orphaned subprocess {task['child_pid']} from old server")
                 kill_process_tree(task["child_pid"])
 
             conn.execute("DELETE FROM queue WHERE id = ?", (task["id"],))
@@ -221,7 +221,7 @@ def cleanup_queue(conn, queue_name: str, queue_capacities: dict[str, int] | None
                 old_server_id=task["server_id"],
                 reason="stale_server_instance",
             )
-            print(log_fmt(f"WARNING: Cleared task from old server instance (ID: {task['id']}, old_server: {task['server_id']})"))
+            log_to_stderr(f"WARNING: Cleared task from old server instance (ID: {task['id']}, old_server: {task['server_id']})")
 
         # Cleanup 2: Tasks with our PID AND server_id but not in active tracking set
         # This catches tasks left behind when clients disconnect without proper cleanup
@@ -237,7 +237,7 @@ def cleanup_queue(conn, queue_name: str, queue_capacities: dict[str, int] | None
             if orphan["id"] not in active_ids:
                 # This task belongs to us but we're not tracking it - it's orphaned
                 if orphan["child_pid"] and is_process_alive(orphan["child_pid"]):
-                    print(log_fmt(f"WARNING: Killing orphaned subprocess {orphan['child_pid']}"))
+                    log_to_stderr(f"WARNING: Killing orphaned subprocess {orphan['child_pid']}")
                     kill_process_tree(orphan["child_pid"])
 
                 conn.execute("DELETE FROM queue WHERE id = ?", (orphan["id"],))
@@ -248,10 +248,15 @@ def cleanup_queue(conn, queue_name: str, queue_capacities: dict[str, int] | None
                     status=orphan["status"],
                     reason="not_in_active_set",
                 )
-                print(log_fmt(f"WARNING: Cleared orphaned task (ID: {orphan['id']}, status: {orphan['status']})"))
+                log_to_stderr(f"WARNING: Cleared orphaned task (ID: {orphan['id']}, status: {orphan['status']})")
 
     if conn.in_transaction:
         conn.commit()
+
+
+def log_to_stderr(msg: str):
+    """Log a server message to stderr, because stdout carries the MCP stdio transport."""
+    print(log_fmt(msg), file=sys.stderr)
 
 
 # --- Output File Management ---
@@ -725,6 +730,10 @@ async def _execute_command(
         command,
         cwd=working_directory,
         env=env,
+        # The server's own stdin is the MCP stdio transport. A command that inherits it can
+        # read the client's requests or leave the pipe non-blocking (Node does this for any
+        # stdin it touches), after which the server's next read fails and it shuts down.
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,

@@ -548,8 +548,11 @@ def is_task_queue_process(pid: int) -> bool:
     try:
         import subprocess
 
+        # `-ww` lifts the width limit: plain `ps` truncates `args` to $COLUMNS, which MCP
+        # servers inherit from the agent's terminal, cutting off the entrypoint of long
+        # `uvx` command lines and making a live server look like a reused PID.
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "args="],
+            ["ps", "-ww", "-p", str(pid), "-o", "args="],
             capture_output=True,
             text=True,
             timeout=5,

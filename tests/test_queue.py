@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ os.environ["TASK_QUEUE_POLL_READY"] = "0.1"
 
 from datetime import datetime, timedelta
 from fastmcp import Client
+from fastmcp.client.transports import PythonStdioTransport, StdioTransport
 import queue_core
 import task_queue
 from task_queue import (
@@ -776,6 +778,102 @@ async def test_large_stderr_does_not_deadlock(client):
 
 
 @pytest.mark.asyncio
+async def test_command_cannot_disturb_the_stdio_transport(tmp_path):
+    """A command must not inherit the server's stdin, which carries the MCP stdio transport.
+
+    Node marks any stdin it touches non-blocking. That flag lives on the pipe shared with an
+    inheriting parent, so the server's next read fails and it exits. This test sets the flag
+    directly, so it needs no Node, and runs the server over a real stdio transport because
+    the in-memory client used by the other tests has no stdin to share.
+    """
+    script = "import os; os.set_blocking(0, False)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    stdio_client = Client(
+        PythonStdioTransport(
+            Path(task_queue.__file__),
+            args=[f"--data-dir={tmp_path}"],
+            keep_alive=False,
+        )
+    )
+
+    async with stdio_client:
+        run = await stdio_client.call_tool(
+            "run_task",
+            {
+                "command": command,
+                "working_directory": "/tmp",
+                "queue_name": "stdio_transport_test",
+                "timeout_seconds": 5,
+            },
+        )
+        run_result = run.structured_content["result"]
+        status = await stdio_client.call_tool(
+            "task_status",
+            {"task_id": run_result["task_id"], "wait_seconds": 0},
+        )
+
+    assert run_result["status"] == "success"
+    assert status.structured_content["result"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_warnings_stay_off_the_stdio_transport(tmp_path):
+    """Cleanup warnings must go to stderr, because the server's stdout is the MCP stdio transport.
+
+    A running row whose parent PID is dead makes the next run_task on that queue clear a zombie
+    lock and log a warning. The server's stdout is teed to a file so the test can check that every
+    line on it is a JSON-RPC message, whether or not the client tolerates stray lines. The server
+    runs unbuffered because print() goes through sys.stdout's own buffer, which the transport
+    bypasses: buffered, a stray line would surface only at some later flush, possibly mid-message.
+    """
+    data_dir = tmp_path / "data"
+    queue_core.init_db(queue_core.QueuePaths.from_data_dir(data_dir))
+    dead_process = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_process.wait()
+    with queue_core.get_db(data_dir / "queue.db") as conn:
+        conn.execute(
+            "INSERT INTO queue (queue_name, status, pid) VALUES (?, 'running', ?)",
+            ("stdio_cleanup_test", dead_process.pid),
+        )
+        conn.commit()
+
+    server_stdout_path = tmp_path / "server_stdout.jsonl"
+    server_command = " ".join(
+        shlex.quote(part)
+        for part in [sys.executable, task_queue.__file__, f"--data-dir={data_dir}"]
+    )
+    stdio_client = Client(
+        StdioTransport(
+            command="sh",
+            args=["-c", f"{server_command} | tee {shlex.quote(str(server_stdout_path))}"],
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            keep_alive=False,
+        )
+    )
+
+    async with stdio_client:
+        run = await stdio_client.call_tool(
+            "run_task",
+            {
+                "command": "true",
+                "working_directory": "/tmp",
+                "queue_name": "stdio_cleanup_test",
+                "timeout_seconds": 5,
+            },
+        )
+
+    assert run.structured_content["result"]["status"] == "success"
+    with queue_core.get_db(data_dir / "queue.db") as conn:
+        zombie_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM queue WHERE pid = ?",
+            (dead_process.pid,),
+        ).fetchone()["c"]
+    assert zombie_count == 0
+    for line in server_stdout_path.read_text().splitlines():
+        assert json.loads(line)["jsonrpc"] == "2.0"
+
+
+@pytest.mark.asyncio
 async def test_background_tool_argument_validation(client):
     async with client:
         invalid_wait = await client.call_tool(
@@ -1352,6 +1450,49 @@ def test_is_task_queue_process_accepts_installed_tq_entrypoint(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert queue_core.is_task_queue_process(12345) is True
+
+
+# MCP servers inherit COLUMNS from the agent's terminal, and plain `ps` truncates `args`
+# to it, cutting off the entrypoint of a long `uvx` command line.
+NARROW_TERMINAL_COLUMNS = "80"
+LONG_ARGV_PADDING = "x" * 150
+
+
+@contextmanager
+def spawn_process_with_argv(argv: list[str]):
+    """Run a python process that blocks on stdin, showing `argv` in `ps`.
+
+    argv[0] is a bare name rather than sys.executable, whose venv path lives under the
+    repository checkout and would itself contain `agent-task-queue`.
+    """
+    process = subprocess.Popen(
+        argv,
+        executable=sys.executable,
+        stdin=subprocess.PIPE,
+    )
+    try:
+        yield process
+    finally:
+        process.stdin.close()
+        process.wait()
+
+
+def test_is_task_queue_process_reads_full_command_line_in_narrow_terminal(monkeypatch):
+    """The entrypoint past the terminal width must still identify a live queue server."""
+    monkeypatch.setenv("COLUMNS", NARROW_TERMINAL_COLUMNS)
+    argv = ["python3", "-c", "import sys; sys.stdin.read()", LONG_ARGV_PADDING, "agent-task-queue"]
+
+    with spawn_process_with_argv(argv) as process:
+        assert queue_core.is_task_queue_process(process.pid) is True
+
+
+def test_is_task_queue_process_rejects_long_unrelated_command_line(monkeypatch):
+    """A reused PID running something else must still be rejected."""
+    monkeypatch.setenv("COLUMNS", NARROW_TERMINAL_COLUMNS)
+    argv = ["python3", "-c", "import sys; sys.stdin.read()", LONG_ARGV_PADDING, "unrelated"]
+
+    with spawn_process_with_argv(argv) as process:
+        assert queue_core.is_task_queue_process(process.pid) is False
 
 
 def test_attempt_task_start_after_core_cleanup_commit_on_same_connection():
